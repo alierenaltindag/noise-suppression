@@ -18,6 +18,7 @@ export class DeepFilterNoiseFilterProcessor implements TrackProcessor<Track.Kind
   private externalAudioContext: AudioContext | null = null;
   private ownsAudioContext = false;
   private sampleRate: number;
+  private _isWarmedUp = false;
 
   constructor(options: DeepFilterNoiseFilterOptions = {}) {
     const cfg = {
@@ -39,13 +40,48 @@ export class DeepFilterNoiseFilterProcessor implements TrackProcessor<Track.Kind
     return typeof AudioContext !== 'undefined' && typeof WebAssembly !== 'undefined';
   }
 
+  /**
+   * Preload / warmup: downloads WASM + model, registers worklet, creates node,
+   * waits for READY message from worklet. After this, the processor is fully
+   * initialized with bypass=true. Connecting a track is then instant.
+   * Safe to call multiple times — only runs once.
+   */
+  async preload(): Promise<void> {
+    if (this._isWarmedUp) return;
+
+    this.ensureAudioContext();
+
+    if (this.audioContext!.state !== 'running') {
+      try { await this.audioContext!.resume(); } catch {}
+    }
+
+    // Full warmup: WASM download + compile + worklet registration + node creation + wait for READY
+    this.workletNode = await this.processor.warmup(this.audioContext!);
+
+    // Create destination now so processedTrack is ready
+    if (!this.destination) {
+      this.destination = this.audioContext!.createMediaStreamDestination();
+      this.processedTrack = this.destination.stream.getAudioTracks()[0];
+    }
+
+    this._isWarmedUp = true;
+  }
+
   init = async (opts: { track?: MediaStreamTrack; mediaStreamTrack?: MediaStreamTrack }): Promise<void> => {
     const track = opts.track ?? opts.mediaStreamTrack;
     if (!track) {
       throw new Error('DeepFilterNoiseFilterProcessor.init: missing MediaStreamTrack');
     }
     this.originalTrack = track;
-    await this.ensureGraph();
+
+    if (this._isWarmedUp) {
+      // Fast path: everything is pre-initialized, just connect the source node
+      this.connectSourceTrack(track);
+      await this.setEnabled(this.enabled);
+    } else {
+      // Fallback: full init (cold start)
+      await this.ensureGraph();
+    }
   };
 
   restart = async (opts: { track?: MediaStreamTrack; mediaStreamTrack?: MediaStreamTrack }): Promise<void> => {
@@ -53,7 +89,13 @@ export class DeepFilterNoiseFilterProcessor implements TrackProcessor<Track.Kind
     if (track) {
       this.originalTrack = track;
     }
-    await this.ensureGraph();
+
+    if (this._isWarmedUp && this.originalTrack) {
+      this.connectSourceTrack(this.originalTrack);
+      await this.setEnabled(this.enabled);
+    } else {
+      await this.ensureGraph();
+    }
   };
 
   setEnabled = async (enable: boolean): Promise<boolean> => {
@@ -89,14 +131,28 @@ export class DeepFilterNoiseFilterProcessor implements TrackProcessor<Track.Kind
   destroy = async (): Promise<void> => {
     await this.teardownGraph();
     this.processor.destroy();
+    this._isWarmedUp = false;
   };
 
-  private async ensureGraph(): Promise<void> {
-    if (!this.originalTrack) {
-      throw new Error('No source track');
+  /**
+   * Connect (or reconnect) a source track to the already-initialized graph.
+   * This is the fast path — no WASM, no worklet registration, just a source node swap.
+   */
+  private connectSourceTrack(track: MediaStreamTrack): void {
+    if (!this.audioContext || !this.workletNode || !this.destination) {
+      throw new Error('Graph not initialized — call preload() first');
     }
 
-    // Use external AudioContext if provided, otherwise create one
+    // Disconnect old source if any
+    if (this.sourceNode) {
+      try { this.sourceNode.disconnect(); } catch {}
+    }
+
+    this.sourceNode = this.audioContext.createMediaStreamSource(new MediaStream([track]));
+    this.sourceNode.connect(this.workletNode).connect(this.destination);
+  }
+
+  private ensureAudioContext(): void {
     if (!this.audioContext) {
       if (this.externalAudioContext) {
         this.audioContext = this.externalAudioContext;
@@ -106,34 +162,38 @@ export class DeepFilterNoiseFilterProcessor implements TrackProcessor<Track.Kind
         this.ownsAudioContext = true;
       }
     }
+  }
 
-    if (this.audioContext.state !== 'running') {
-      try {
-        await this.audioContext.resume();
-      } catch {
-        // Ignore resume errors
-      }
+  /**
+   * Full cold-start graph setup (fallback when preload() wasn't called).
+   */
+  private async ensureGraph(): Promise<void> {
+    if (!this.originalTrack) {
+      throw new Error('No source track');
+    }
+
+    this.ensureAudioContext();
+
+    if (this.audioContext!.state !== 'running') {
+      try { await this.audioContext!.resume(); } catch {}
     }
 
     await this.processor.initialize();
 
     if (!this.workletNode) {
-      const node = await this.processor.createAudioWorkletNode(this.audioContext);
+      const node = await this.processor.createAudioWorkletNode(this.audioContext!);
       this.workletNode = node;
+      // Wait for worklet READY even in cold-start path
+      await this.processor.waitForReady();
     }
 
     if (!this.destination) {
-      this.destination = this.audioContext.createMediaStreamDestination();
+      this.destination = this.audioContext!.createMediaStreamDestination();
       this.processedTrack = this.destination.stream.getAudioTracks()[0];
     }
 
-    if (this.sourceNode) {
-      this.sourceNode.disconnect();
-    }
-
-    this.sourceNode = this.audioContext.createMediaStreamSource(new MediaStream([this.originalTrack]));
-
-    this.sourceNode.connect(this.workletNode).connect(this.destination);
+    this.connectSourceTrack(this.originalTrack);
+    this._isWarmedUp = true;
 
     await this.setEnabled(this.enabled);
   }

@@ -61,6 +61,46 @@ export class DeepFilterNet3Core {
     return this.workletNode;
   }
 
+  /**
+   * Wait for the worklet to post a READY message, meaning WASM init is done.
+   * Call this after createAudioWorkletNode() to ensure the worklet is fully ready.
+   */
+  waitForReady(): Promise<void> {
+    if (!this.workletNode) {
+      return Promise.reject(new Error('No worklet node — call createAudioWorkletNode first'));
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      const node = this.workletNode!;
+      // Save existing onmessage handler if any
+      const prevHandler = node.port.onmessage;
+      node.port.onmessage = (event: MessageEvent) => {
+        if (event.data?.type === 'READY') {
+          // Restore previous handler
+          node.port.onmessage = prevHandler;
+          resolve();
+        } else if (event.data?.type === 'ERROR') {
+          node.port.onmessage = prevHandler;
+          reject(new Error(event.data.error || 'Worklet init failed'));
+        } else if (prevHandler) {
+          prevHandler.call(node.port, event);
+        }
+      };
+    });
+  }
+
+  /**
+   * Full warmup: download WASM + model, register worklet, create node, wait for READY.
+   * After this resolves, the processor is fully initialized and bypass=true.
+   * Connecting a track afterwards is instant (no CPU spike, no audio glitch).
+   */
+  async warmup(audioContext: AudioContext): Promise<AudioWorkletNode> {
+    await this.initialize();
+    const node = await this.createAudioWorkletNode(audioContext);
+    await this.waitForReady();
+    return node;
+  }
+
   setSuppressionLevel(level: number): void {
     if (!this.workletNode || typeof level !== 'number' || isNaN(level)) return;
 

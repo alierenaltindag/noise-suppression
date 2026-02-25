@@ -10,7 +10,7 @@ class DeepFilterAudioProcessor extends AudioWorkletProcessor {
   private inputReadPos = 0;
   private outputWritePos = 0;
   private outputReadPos = 0;
-  private bypass = false;
+  private bypass = true; // Start bypassed — passthrough until WASM is ready
   private isInitialized = false;
   private bufferSize: number;
   private tempFrame: Float32Array | null = null;
@@ -21,6 +21,11 @@ class DeepFilterAudioProcessor extends AudioWorkletProcessor {
     this.bufferSize = 8192;
     this.inputBuffer = new Float32Array(this.bufferSize);
     this.outputBuffer = new Float32Array(this.bufferSize);
+
+    // Listen for messages immediately (before init, so SET_BYPASS works during warmup)
+    this.port.onmessage = (event: MessageEvent) => {
+      this.handleMessage(event.data);
+    };
 
     try {
       // Initialize WASM from pre-compiled module
@@ -43,14 +48,18 @@ class DeepFilterAudioProcessor extends AudioWorkletProcessor {
       // Pre-allocate temp frame buffer for processing
       this.tempFrame = new Float32Array(frameLength);
 
+      // Pre-fill output ring buffer with silence (one frameLength worth)
+      // so the first process() call after bypass=false has data to output
+      this.outputWritePos = frameLength;
+
       this.isInitialized = true;
 
-      this.port.onmessage = (event: MessageEvent) => {
-        this.handleMessage(event.data);
-      };
+      // Notify main thread that WASM init is complete and worklet is ready
+      this.port.postMessage({ type: 'READY' });
     } catch (error) {
       console.error('Failed to initialize DeepFilter in AudioWorklet:', error);
       this.isInitialized = false;
+      this.port.postMessage({ type: 'ERROR', error: String(error) });
     }
   }
 
