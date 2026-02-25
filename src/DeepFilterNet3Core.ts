@@ -189,6 +189,14 @@ export class DeepFilterNet3Core {
     return this.isInitialized && this.workletNode !== null && this.worker !== null;
   }
 
+  get hasWorker(): boolean {
+    return this.worker !== null;
+  }
+
+  get hasWorkletNode(): boolean {
+    return this.workletNode !== null;
+  }
+
   destroy(): void {
     if (!this.isInitialized) return;
 

@@ -194,6 +194,12 @@ class DeepFilterNet3Core {
     isReady() {
         return this.isInitialized && this.workletNode !== null && this.worker !== null;
     }
+    get hasWorker() {
+        return this.worker !== null;
+    }
+    get hasWorkletNode() {
+        return this.workletNode !== null;
+    }
     destroy() {
         if (!this.isInitialized)
             return;
@@ -323,6 +329,9 @@ class DeepFilterNoiseFilterProcessor {
     }
     isNoiseSuppressionEnabled() {
         return this.processor.isNoiseSuppressionEnabled();
+    }
+    get workerRunning() {
+        return this.processor.hasWorker;
     }
     setAdaptiveEnabled(enabled) {
         this.processor.setAdaptiveEnabled(enabled);

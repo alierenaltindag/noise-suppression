@@ -116,6 +116,10 @@ export class DeepFilterNoiseFilterProcessor implements TrackProcessor<Track.Kind
     return this.processor.isNoiseSuppressionEnabled();
   }
 
+  get workerRunning(): boolean {
+    return this.processor.hasWorker;
+  }
+
   setAdaptiveEnabled(enabled: boolean): void {
     this.processor.setAdaptiveEnabled(enabled);
   }
