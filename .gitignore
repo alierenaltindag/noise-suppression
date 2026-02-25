@@ -1,10 +1,8 @@
 node_modules
-dist
 examples/react-app/node_modules
 *.tgz
 *.log
 node_modules/
-dist/
 .env
 .DS_Store
 *.log
