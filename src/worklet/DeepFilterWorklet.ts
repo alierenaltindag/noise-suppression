@@ -15,18 +15,19 @@ class DeepFilterAudioProcessor extends AudioWorkletProcessor {
   private bufferSize: number;
   private tempFrame: Float32Array | null = null;
 
+  // Stored options for lazy init
+  private pendingOptions: ProcessorOptions | null = null;
+
   // Adaptive suppression state
   private adaptiveEnabled = false;
-  private baseSuppression = 50;   // User-set level (used as max)
-  private minSuppression = 10;    // Minimum suppression when quiet
+  private baseSuppression = 50;
+  private minSuppression = 10;
   private currentSuppression = 50;
-  private rmsSmoothed = 0;        // Exponentially smoothed RMS
-  // Noise floor tracking
-  private noiseFloor = 0.001;     // Estimated ambient noise level
-  private noiseFloorAlpha = 0.001; // Very slow adaptation for noise floor
-  // Thresholds (RMS values, not dB)
-  private quietThreshold = 0.005;  // Below this = quiet environment
-  private loudThreshold = 0.03;    // Above this = full suppression needed
+  private rmsSmoothed = 0;
+  private noiseFloor = 0.001;
+  private noiseFloorAlpha = 0.001;
+  private quietThreshold = 0.005;
+  private loudThreshold = 0.03;
 
   constructor(options: AudioWorkletNodeOptions & { processorOptions: ProcessorOptions }) {
     super();
@@ -35,51 +36,73 @@ class DeepFilterAudioProcessor extends AudioWorkletProcessor {
     this.inputBuffer = new Float32Array(this.bufferSize);
     this.outputBuffer = new Float32Array(this.bufferSize);
 
-    // Listen for messages immediately (before init, so SET_BYPASS works during warmup)
+    // Store options for lazy init — do NOT init WASM here.
+    // Constructor runs synchronously on the audio render thread and blocks
+    // the main thread (new AudioWorkletNode() waits for it). Heavy WASM
+    // init here causes WASAPI buffer underruns on Windows, disrupting
+    // audio in other applications. Instead, WASM init is triggered via
+    // an INIT message after the node is created.
+    this.pendingOptions = options.processorOptions;
+    this.baseSuppression = options.processorOptions.suppressionLevel ?? 50;
+    this.currentSuppression = this.baseSuppression;
+
+    // Listen for messages immediately (SET_BYPASS, INIT, etc.)
     this.port.onmessage = (event: MessageEvent) => {
       this.handleMessage(event.data);
     };
+  }
+
+  /**
+   * Lazy WASM initialization — triggered by INIT message from main thread.
+   * Runs on the audio thread but does NOT block the main thread or
+   * AudioWorkletNode constructor. process() continues in bypass/passthrough
+   * mode while this runs, so no buffer underruns occur.
+   */
+  private initWasm(): void {
+    if (this.isInitialized || !this.pendingOptions) return;
 
     try {
-      // Initialize WASM from pre-compiled module
-      wasm_bindgen.initSync(options.processorOptions.wasmModule);
+      wasm_bindgen.initSync(this.pendingOptions.wasmModule);
 
-      const modelBytes = new Uint8Array(options.processorOptions.modelBytes);
+      const modelBytes = new Uint8Array(this.pendingOptions.modelBytes);
       const handle = wasm_bindgen.df_create(
         modelBytes,
-        options.processorOptions.suppressionLevel ?? 50
+        this.pendingOptions.suppressionLevel ?? 50
       );
 
       const frameLength = wasm_bindgen.df_get_frame_length(handle);
 
       this.dfModel = { handle, frameLength };
-      this.baseSuppression = options.processorOptions.suppressionLevel ?? 50;
-      this.currentSuppression = this.baseSuppression;
 
       this.bufferSize = frameLength * 4;
       this.inputBuffer = new Float32Array(this.bufferSize);
       this.outputBuffer = new Float32Array(this.bufferSize);
 
-      // Pre-allocate temp frame buffer for processing
+      // Pre-allocate temp frame buffer
       this.tempFrame = new Float32Array(frameLength);
 
       // Pre-fill output ring buffer with silence (one frameLength worth)
-      // so the first process() call after bypass=false has data to output
       this.outputWritePos = frameLength;
 
       this.isInitialized = true;
+      this.pendingOptions = null;
 
-      // Notify main thread that WASM init is complete and worklet is ready
+      // Notify main thread that WASM init is complete
       this.port.postMessage({ type: 'READY' });
     } catch (error) {
       console.error('Failed to initialize DeepFilter in AudioWorklet:', error);
       this.isInitialized = false;
+      this.pendingOptions = null;
       this.port.postMessage({ type: 'ERROR', error: String(error) });
     }
   }
 
   private handleMessage(data: { type: string; value?: number | boolean }): void {
     switch (data.type) {
+      case WorkletMessageTypes.INIT:
+        // Trigger lazy WASM initialization
+        this.initWasm();
+        break;
       case WorkletMessageTypes.SET_SUPPRESSION_LEVEL:
         if (this.dfModel && typeof data.value === 'number') {
           const level = Math.max(0, Math.min(100, Math.floor(data.value)));
@@ -96,7 +119,6 @@ class DeepFilterAudioProcessor extends AudioWorkletProcessor {
       case WorkletMessageTypes.SET_ADAPTIVE:
         this.adaptiveEnabled = Boolean(data.value);
         if (!this.adaptiveEnabled && this.dfModel) {
-          // Revert to base level when adaptive is turned off
           this.currentSuppression = this.baseSuppression;
           wasm_bindgen.df_set_atten_lim(this.dfModel.handle, this.baseSuppression);
         }
@@ -104,10 +126,6 @@ class DeepFilterAudioProcessor extends AudioWorkletProcessor {
     }
   }
 
-  /**
-   * Compute RMS of a buffer segment.
-   * Runs in audio thread — kept minimal.
-   */
   private computeRMS(buf: Float32Array, len: number): number {
     let sum = 0;
     for (let i = 0; i < len; i++) {
@@ -116,43 +134,26 @@ class DeepFilterAudioProcessor extends AudioWorkletProcessor {
     return Math.sqrt(sum / len);
   }
 
-  /**
-   * Adapt suppression level based on current noise environment.
-   * Called once per frame (every ~10ms at 48kHz/480 frame).
-   *
-   * Logic:
-   * - Track noise floor with very slow EMA (adapts over seconds)
-   * - If RMS is near noise floor → environment is quiet → lower suppression
-   * - If RMS is well above noise floor → noisy → raise suppression toward base
-   * - Smooth transitions to avoid audible jumps
-   */
   private adaptSuppression(rms: number): void {
     if (!this.dfModel) return;
 
-    // Update noise floor estimate (only when signal is relatively quiet)
     if (rms < this.noiseFloor * 3) {
       this.noiseFloor = this.noiseFloor * (1 - this.noiseFloorAlpha) + rms * this.noiseFloorAlpha;
     }
 
-    // Smooth the RMS to avoid reacting to transients
     const alpha = 0.05;
     this.rmsSmoothed = this.rmsSmoothed * (1 - alpha) + rms * alpha;
 
-    // Map smoothed RMS to suppression level
     let targetSuppression: number;
     if (this.rmsSmoothed <= this.quietThreshold) {
-      // Quiet environment — minimal suppression saves CPU
       targetSuppression = this.minSuppression;
     } else if (this.rmsSmoothed >= this.loudThreshold) {
-      // Noisy environment — full user-set suppression
       targetSuppression = this.baseSuppression;
     } else {
-      // Linear interpolation between quiet and loud thresholds
       const t = (this.rmsSmoothed - this.quietThreshold) / (this.loudThreshold - this.quietThreshold);
       targetSuppression = this.minSuppression + t * (this.baseSuppression - this.minSuppression);
     }
 
-    // Only update WASM if level changed by at least 2 (avoid excessive calls)
     const rounded = Math.floor(targetSuppression);
     if (Math.abs(rounded - this.currentSuppression) >= 2) {
       this.currentSuppression = rounded;
@@ -197,13 +198,11 @@ class DeepFilterAudioProcessor extends AudioWorkletProcessor {
     const frameLength = this.dfModel.frameLength;
 
     while (this.getInputAvailable() >= frameLength) {
-      // Extract frame from ring buffer
       for (let i = 0; i < frameLength; i++) {
         this.tempFrame[i] = this.inputBuffer[this.inputReadPos];
         this.inputReadPos = (this.inputReadPos + 1) % this.bufferSize;
       }
 
-      // Adaptive suppression: adjust level based on noise environment
       if (this.adaptiveEnabled) {
         const rms = this.computeRMS(this.tempFrame, frameLength);
         this.adaptSuppression(rms);
@@ -211,7 +210,6 @@ class DeepFilterAudioProcessor extends AudioWorkletProcessor {
 
       const processed = wasm_bindgen.df_process_frame(this.dfModel.handle, this.tempFrame);
 
-      // Write to output ring buffer
       for (let i = 0; i < processed.length; i++) {
         this.outputBuffer[this.outputWritePos] = processed[i];
         this.outputWritePos = (this.outputWritePos + 1) % this.bufferSize;

@@ -50,6 +50,9 @@ export class DeepFilterNet3Core {
 
     await createWorkletModule(audioContext, workletCode);
 
+    // Create node with lazy init — constructor does NOT init WASM.
+    // This makes `new AudioWorkletNode()` return instantly without
+    // blocking the audio render thread (no WASAPI buffer underruns).
     this.workletNode = new AudioWorkletNode(audioContext, 'deepfilter-audio-processor', {
       processorOptions: {
         wasmModule: this.assets.wasmModule,
@@ -57,6 +60,10 @@ export class DeepFilterNet3Core {
         suppressionLevel: this.config.noiseReductionLevel
       }
     });
+
+    // Trigger WASM init via message — runs on audio thread asynchronously.
+    // process() stays in bypass/passthrough mode until init completes.
+    this.workletNode.port.postMessage({ type: WorkletMessageTypes.INIT });
 
     return this.workletNode;
   }
