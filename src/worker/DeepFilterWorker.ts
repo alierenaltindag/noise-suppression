@@ -23,15 +23,17 @@ let model: DeepFilterModel | null = null;
 let workletPort: MessagePort | null = null;
 
 // Adaptive suppression state
-let adaptiveEnabled = false;
-let baseSuppression = 25;
-let minSuppression = 8;
-let currentSuppression = 25;
+let adaptiveEnabled = true;
+
+// Limiter settings (dB, 0 -> no attenuation, 100 -> maximum attenuation)
+let maxSuppression = 25;  // User's provided suppression level acts as our max suppression on silence
+const minSuppression = 10;  // Minimum suppression during active speech
+let currentSuppression = maxSuppression;
 let rmsSmoothed = 0;
-let noiseFloor = 0.001;
-const noiseFloorAlpha = 0.001;
-const quietThreshold = 0.005;
-const loudThreshold = 0.03;
+
+// Dynamic Noise Floor tracking parameters
+let noiseFloor = 0.005; 
+const noiseFloorAlpha = 0.0005; 
 
 function computeRMS(buf: Float32Array, len: number): number {
   let sum = 0;
@@ -44,25 +46,40 @@ function computeRMS(buf: Float32Array, len: number): number {
 function adaptSuppression(rms: number): void {
   if (!model) return;
 
-  if (rms < noiseFloor * 3) {
+  // 1. Calculate and track background noise floor
+  if (rms < noiseFloor * 2.5) {
     noiseFloor = noiseFloor * (1 - noiseFloorAlpha) + rms * noiseFloorAlpha;
   }
+  
+  const effectiveNoiseFloor = Math.max(noiseFloor, 0.0001);
 
-  const alpha = 0.05;
+  // 2. Smooth the instantaneous Audio Signal (RMS)
+  const isAttack = rms > rmsSmoothed;
+  // React fast when speaking (attack), decay slowly when paused (release)
+  const alpha = isAttack ? 0.4 : 0.02; 
   rmsSmoothed = rmsSmoothed * (1 - alpha) + rms * alpha;
 
+  // 3. Signal-to-Noise Ratio (SNR) based Relative Threshold Algorithm
+  const SNR = rmsSmoothed / effectiveNoiseFloor;
+  const voiceSNRThreshold = 6.0;  // Threshold for definite human voice
+  const quietSNRThreshold = 2.0;  // Threshold for absolute silence/ambient noise
+
   let target: number;
-  if (rmsSmoothed <= quietThreshold) {
-    target = minSuppression;
-  } else if (rmsSmoothed >= loudThreshold) {
-    target = baseSuppression;
+
+  if (SNR >= voiceSNRThreshold) {
+    target = minSuppression;  // User is speaking, reduce suppression to minimize voice distortion
+  } else if (SNR <= quietSNRThreshold) {
+    target = maxSuppression;  // User is quiet, maximize suppression to mute fans/clicks
   } else {
-    const t = (rmsSmoothed - quietThreshold) / (loudThreshold - quietThreshold);
-    target = minSuppression + t * (baseSuppression - minSuppression);
+    // Soft transition zone (interpolate between max and min based on SNR strength)
+    const t = (SNR - quietSNRThreshold) / (voiceSNRThreshold - quietSNRThreshold);
+    target = maxSuppression - t * (maxSuppression - minSuppression);
   }
 
   const rounded = Math.floor(target);
-  if (Math.abs(rounded - currentSuppression) >= 2) {
+  
+  // Update state only if changed >= 1dB to avoid jittering
+  if (Math.abs(rounded - currentSuppression) >= 1) {
     currentSuppression = rounded;
     wasm_bindgen.df_set_atten_lim(model.handle, rounded);
   }
@@ -101,8 +118,8 @@ self.onmessage = (event: MessageEvent) => {
         }
 
         model = { handle, frameLength };
-        baseSuppression = suppressionLevel ?? 50;
-        currentSuppression = baseSuppression;
+        maxSuppression = suppressionLevel ?? 50;
+        currentSuppression = maxSuppression;
 
         (self as any).postMessage({ type: 'READY', frameLength });
       } catch (error) {
@@ -129,7 +146,7 @@ self.onmessage = (event: MessageEvent) => {
 
     case 'SET_SUPPRESSION_LEVEL': {
       const level = Math.max(0, Math.min(100, Math.floor(event.data.value)));
-      baseSuppression = level;
+      maxSuppression = level;
       if (!adaptiveEnabled && model) {
         currentSuppression = level;
         wasm_bindgen.df_set_atten_lim(model.handle, level);
@@ -140,8 +157,8 @@ self.onmessage = (event: MessageEvent) => {
     case 'SET_ADAPTIVE': {
       adaptiveEnabled = Boolean(event.data.value);
       if (!adaptiveEnabled && model) {
-        currentSuppression = baseSuppression;
-        wasm_bindgen.df_set_atten_lim(model.handle, baseSuppression);
+        currentSuppression = maxSuppression;
+        wasm_bindgen.df_set_atten_lim(model.handle, maxSuppression);
       }
       break;
     }
